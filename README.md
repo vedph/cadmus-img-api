@@ -10,4 +10,5 @@ This is a Cadmus API layer used to test the Cadmus imaging frontend components i
 
 ## History
 
+- 2023-05-24: updated packages (breaking change in general parts introducing [AssertedCompositeId](https://github.com/vedph/cadmus-bricks-shell/blob/master/projects/myrmidon/cadmus-refs-asserted-ids/README.md#asserted-composite-id)).
 - 2023-05-16: updated packages.
