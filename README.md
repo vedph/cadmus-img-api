@@ -1,4 +1,4 @@
-# Cadmus Imaging API
+﻿# Cadmus Imaging API
 
 Quick Docker image build:
 
@@ -9,6 +9,10 @@ Quick Docker image build:
 This is a Cadmus API layer used to test the Cadmus imaging frontend components in their [shell](https://github.com/vedph/cadmus-img-shell).
 
 ## History
+
+### 4.0.0
+
+- 2023-11-18: ⚠️ Upgraded to .NET 8.
 
 ### 3.0.0
 

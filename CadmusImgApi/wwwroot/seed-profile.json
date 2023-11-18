@@ -219,7 +219,7 @@
           "value": "external IDs"
         },
         {
-          "id": "it.vedph.img.gallery-image-annotations",
+          "id": "it.vedph.img.w3c-gallery-image-annotations",
           "value": "image annotations"
         },
         {
@@ -662,9 +662,6 @@
       },
       {
         "id": "seed.it.vedph.external-ids"
-      },
-      {
-        "id": "seed.it.vedph.img.gallery-image-annotations"
       },
       {
         "id": "seed.it.vedph.historical-events"
