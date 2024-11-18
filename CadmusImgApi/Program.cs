@@ -1,10 +1,22 @@
-using System.Collections;
+using Cadmus.Api.Services;
+using Cadmus.Api.Services.Seeding;
+using Cadmus.Core;
+using Fusi.Api.Auth.Models;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
 using Serilog;
 using System.Diagnostics;
+using Cadmus.Core.Config;
+using Cadmus.Seed;
+using Fusi.Api.Auth.Services;
+using System.Text.Json;
 using Serilog.Events;
-using Cadmus.Api.Services.Seeding;
-using Cadmus.Api.Services;
-using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.HttpOverrides;
+using Scalar.AspNetCore;
+using Cadmus.Api.Controllers;
+using Cadmus.Api.Config.Services;
+using Cadmus.Api.Config;
+using Cadmus.Img.Services;
 
 namespace CadmusImgApi;
 
@@ -13,31 +25,84 @@ namespace CadmusImgApi;
 /// </summary>
 public static class Program
 {
-    private static void DumpEnvironmentVars()
-    {
-        Console.WriteLine("ENVIRONMENT VARIABLES:");
-        IDictionary dct = Environment.GetEnvironmentVariables();
-        List<string> keys = new();
-        var enumerator = dct.GetEnumerator();
-        while (enumerator.MoveNext())
-        {
-            keys.Add(((DictionaryEntry)enumerator.Current).Key.ToString()!);
-        }
+    // startup log file name, Serilog is configured later via appsettings.json
+    private const string STARTUP_LOG_NAME = "startup.log";
 
-        foreach (string key in keys.OrderBy(s => s))
-            Console.WriteLine($"{key} = {dct[key]}");
+    private static void ConfigureAppServices(IServiceCollection services,
+        IConfiguration config)
+    {
+        // Cadmus repository
+        string dataCS = string.Format(
+        config.GetConnectionString("Default")!,
+            config.GetValue<string>("DatabaseNames:Data"));
+        services.AddSingleton<IRepositoryProvider>(
+            _ => new ImgRepositoryProvider { ConnectionString = dataCS });
+
+        // part seeder factory provider
+        services.AddSingleton<IPartSeederFactoryProvider,
+            ImgPartSeederFactoryProvider>();
+
+        // item browser factory provider
+        services.AddSingleton<IItemBrowserFactoryProvider>(_ =>
+        new StandardItemBrowserFactoryProvider(
+                config.GetConnectionString("Default")!));
+
+        // index and graph
+        ServiceConfigurator.ConfigureIndexServices(services, config);
+        ServiceConfigurator.ConfigureGraphServices(services, config);
+
+        // previewer
+        services.AddSingleton(p => ServiceConfigurator.GetPreviewer(p, config));
     }
 
     /// <summary>
-    /// Creates the host builder.
+    /// Configures the services.
     /// </summary>
-    /// <param name="args">The arguments.</param>
-    public static IHostBuilder CreateHostBuilder(string[] args) =>
-        Host.CreateDefaultBuilder(args)
-            .ConfigureWebHostDefaults(webBuilder =>
+    /// <param name="services">The services.</param>
+    public static void ConfigureServices(IServiceCollection services,
+        IConfiguration config, IHostEnvironment hostEnvironment)
+    {
+        // configuration
+        services.AddSingleton(_ => config);
+        ServiceConfigurator.ConfigureOptionsServices(services, config);
+
+        // security
+        ServiceConfigurator.ConfigureCorsServices(services, config);
+        ServiceConfigurator.ConfigureRateLimiterService(services, config, hostEnvironment);
+        ServiceConfigurator.ConfigureAuthServices(services, config);
+
+        // proxy
+        services.AddHttpClient();
+        services.AddResponseCaching();
+
+        // API controllers
+        services.AddControllers();
+        // camel-case JSON in response
+        services.AddMvc()
+            // https://docs.microsoft.com/en-us/aspnet/core/migration/22-to-30?view=aspnetcore-2.2&tabs=visual-studio#jsonnet-support
+            .AddJsonOptions(options =>
             {
-                webBuilder.UseStartup<Startup>();
+                options.JsonSerializerOptions.PropertyNamingPolicy =
+                    JsonNamingPolicy.CamelCase;
             });
+
+        // framework services
+        // IMemoryCache: https://docs.microsoft.com/en-us/aspnet/core/performance/caching/memory
+        services.AddMemoryCache();
+
+        // user repository service
+        services.AddScoped<IUserRepository<NamedUser>,
+            UserRepository<NamedUser, IdentityRole>>();
+
+        // messaging
+        ServiceConfigurator.ConfigureMessagingServices(services);
+
+        // logging
+        ServiceConfigurator.ConfigureLogging(services);
+
+        // app services
+        ConfigureAppServices(services, config);
+    }
 
     /// <summary>
     /// Entry point.
@@ -45,63 +110,116 @@ public static class Program
     /// <param name="args">The arguments.</param>
     public static async Task<int> Main(string[] args)
     {
+        // early startup logging to ensure we catch any exceptions
         Log.Logger = new LoggerConfiguration()
             .MinimumLevel.Debug()
             .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
             .Enrich.FromLogContext()
             .WriteTo.Console()
 #if DEBUG
-            .WriteTo.File("cadmus-log.txt", rollingInterval: RollingInterval.Day)
+            .WriteTo.File(STARTUP_LOG_NAME, rollingInterval: RollingInterval.Day)
 #endif
             .CreateLogger();
 
         try
         {
-            Log.Information("Starting Cadmus Img API host");
-            DumpEnvironmentVars();
+            Log.Information("Starting Cadmus API host");
+            ServiceConfigurator.DumpEnvironmentVars();
 
-            // this is the place for seeding:
-            // see https://stackoverflow.com/questions/45148389/how-to-seed-in-entity-framework-core-2
-            // and https://docs.microsoft.com/en-us/aspnet/core/migration/1x-to-2x/?view=aspnetcore-2.1#move-database-initialization-code
-            var host = await CreateHostBuilder(args)
-                // add in-memory config to override Serilog connection string
-                // as there is no way of configuring it outside appsettings
-                // https://docs.microsoft.com/en-us/aspnet/core/fundamentals/configuration/?view=aspnetcore-5.0#in-memory-provider-and-binding-to-a-poco-class
-                .ConfigureAppConfiguration((context, config) =>
+            WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
+            ServiceConfigurator.ConfigureLogger(builder);
+
+            IConfiguration config = new ConfigurationService(builder.Environment)
+                .Configuration;
+
+            ServiceConfigurator.ConfigureServices(builder.Services, config,
+                builder.Environment);
+            ConfigureAppServices(builder.Services, config);
+
+            builder.Services.AddOpenApi();
+
+            // controllers from Cadmus.Api.Controllers
+            builder.Services.AddControllers()
+                .AddApplicationPart(typeof(ItemController).Assembly)
+                .AddControllersAsServices();
+
+            WebApplication app = builder.Build();
+
+            // forward headers for use with an eventual reverse proxy
+            app.UseForwardedHeaders(new ForwardedHeadersOptions
+            {
+                ForwardedHeaders = ForwardedHeaders.XForwardedFor
+                    | ForwardedHeaders.XForwardedProto
+            });
+
+            // development or production
+            if (builder.Environment.IsDevelopment())
+            {
+                app.UseDeveloperExceptionPage();
+            }
+            else
+            {
+                // https://docs.microsoft.com/en-us/aspnet/core/security/enforcing-ssl?view=aspnetcore-5.0&tabs=visual-studio
+                app.UseExceptionHandler("/Error");
+                if (config.GetValue<bool>("Server:UseHSTS"))
                 {
-                    IConfiguration cfg = AppConfigReader.Read();
-                    string csTemplate = cfg.GetValue<string>("Serilog:ConnectionString")!;
-                    string dbName = cfg.GetValue<string>("DatabaseNames:Data")!;
-                    string cs = string.Format(csTemplate, dbName);
-                    Debug.WriteLine($"Serilog:ConnectionString override = {cs}");
-                    Console.WriteLine($"Serilog:ConnectionString override = {cs}");
+                    Console.WriteLine("HSTS: yes");
+                    app.UseHsts();
+                }
+                else
+                {
+                    Console.WriteLine("HSTS: no");
+                }
+            }
 
-                    Dictionary<string, string?> dct = new()
-                    {
-                        { "Serilog:ConnectionString", cs }
-                    };
-                    // (requires Microsoft.Extensions.Configuration package
-                    // to get the MemoryConfigurationProvider)
-                    config.AddInMemoryCollection(dct);
-                })
-                .UseSerilog()
-                .Build()
-                .SeedAsync(); // see Services/HostSeedExtension
+            // HTTPS redirection
+            if (config.GetValue<bool>("Server:UseHttpsRedirection"))
+            {
+                Console.WriteLine("HttpsRedirection: yes");
+                app.UseHttpsRedirection();
+            }
+            else
+            {
+                Console.WriteLine("HttpsRedirection: no");
+            }
 
-            host.Run();
+            // CORS
+            app.UseCors("CorsPolicy");
+            // rate limiter
+            if (!config.GetValue<bool>("RateLimit:IsDisabled"))
+                app.UseRateLimiter();
+            // authentication
+            app.UseAuthentication();
+            app.UseAuthorization();
+            // proxy
+            app.UseResponseCaching();
+
+            // seed auth database (via Services/HostAuthSeedExtensions)
+            await app.SeedAuthAsync();
+
+            // seed Cadmus database (via Services/HostSeedExtension)
+            await app.SeedAsync();
+
+            // map controllers and Scalar API
+            app.MapControllers();
+            app.MapOpenApi();
+            app.MapScalarApiReference();
+
+            Log.Information("Running API");
+            await app.RunAsync();
 
             return 0;
         }
         catch (Exception ex)
         {
-            Log.Fatal(ex, "Cadmus Img API host terminated unexpectedly");
+            Log.Fatal(ex, "Cadmus API host terminated unexpectedly");
             Debug.WriteLine(ex.ToString());
             Console.WriteLine(ex.ToString());
             return 1;
         }
         finally
         {
-            Log.CloseAndFlush();
+            await Log.CloseAndFlushAsync();
         }
     }
 }
