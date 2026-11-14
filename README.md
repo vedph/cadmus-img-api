@@ -10,7 +10,8 @@ This is a Cadmus API layer used to test the Cadmus imaging frontend components i
 
 ## History
 
-- 2025-11-24: ⚠️ upgraded to NET 10.
+- 2026-11-14: ⚠️ upgraded to .NET 11.
+- 2025-11-24: ⚠️ upgraded to .NET 10.
 - 2024-11-20: updated packages.
 
 ### 5.0.0
